@@ -1,150 +1,181 @@
+import re
+import time
 import requests
-from bs4 import BeautifulSoup
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
+
+EXISTING_URL = "https://www.sharesansar.com/existing-issues"
+
+# ShareSansar silently returns 0 records if length >= 100
+# Safe maximum is 50 per request — we paginate to get all records
+PAGE_SIZE = 50
+
+# Delay between page requests to avoid triggering rate limiting
+PAGE_DELAY = 2  # seconds
+
+ISSUE_TYPES = [
+    {"type_id": 1, "label": "IPO"},
+    {"type_id": 2, "label": "FPO"},
+    {"type_id": 3, "label": "RIGHT"},
+    {"type_id": 5, "label": "IPO"},   # IPO-Local
+]
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept":           "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer":          EXISTING_URL,
 }
 
-EXISTING_URL = "https://www.sharesansar.com/existing-issues"
-UPCOMING_URL = "https://www.sharesansar.com/upcoming-issue"
+
+def strip_html(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>", "", str(text)).strip()
 
 
 def make_id(company: str, issue_type: str, open_date: str) -> str:
-    """Generate a unique ID from company + type + open_date."""
-    raw = f"{company}-{issue_type}-{open_date}".lower().replace(" ", "-")
+    raw = f"{company}-{issue_type}-{open_date}".lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
-def parse_existing_issues(soup: BeautifulSoup, tab_id: str, issue_type: str) -> list:
-    """Parse a specific tab table from /existing-issues page."""
-    issues = []
+def fmt_units(val) -> str:
+    try:
+        return f"{int(float(val)):,}"
+    except Exception:
+        return str(val) if val else "N/A"
 
-    section = soup.find("div", {"id": tab_id})
-    if not section:
-        return issues
 
-    table = section.find("table")
-    if not table:
-        return issues
+def status_label(status) -> str:
+    try:
+        s = int(status)
+        if s in (-2, -1): return "coming_soon"
+        elif s == 0:       return "open"
+        else:              return "closed"
+    except Exception:
+        return "unknown"
 
-    rows = table.find_all("tr")[1:]  # skip header row
 
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) < 4:
-            continue
+def fetch_all_pages(type_id: int, label: str) -> list:
+    """
+    Fetch all records for a given issue type using pagination.
+    ShareSansar blocks length >= 100, so we use PAGE_SIZE=50
+    and keep fetching until we have all records.
+    """
+    all_records = []
+    start       = 0
+    total       = None   # unknown until first response
+    draw        = 1
 
-        company   = cols[0].get_text(strip=True)
-        open_date = cols[1].get_text(strip=True)
-        close_date= cols[2].get_text(strip=True)
-        units     = cols[3].get_text(strip=True) if len(cols) > 3 else "N/A"
+    while True:
+        res = requests.get(
+            EXISTING_URL,
+            params={
+                "type":   type_id,
+                "draw":   draw,
+                "start":  start,
+                "length": PAGE_SIZE,
+            },
+            headers=HEADERS,
+            timeout=15,
+        )
+        res.raise_for_status()
+        data = res.json()
 
+        if total is None:
+            total = data.get("recordsTotal", 0)
+            print(f"[scraper] type={type_id} ({label}): {total} total records")
+
+        records = data.get("data", [])
+        if not records:
+            break
+
+        all_records.extend(records)
+        start += len(records)
+        draw  += 1
+
+        print(f"[scraper]   fetched {len(all_records)}/{total}")
+
+        # Stop when we have all records
+        if len(all_records) >= total:
+            break
+
+        # Polite delay between pages
+        time.sleep(PAGE_DELAY)
+
+    return all_records
+
+
+def parse_record(row: dict, label: str) -> dict | None:
+    try:
+        co      = row.get("company", {})
+        company = strip_html(co.get("companyname", ""))
+        symbol  = strip_html(co.get("symbol", ""))
         if not company:
-            continue
+            return None
 
-        issues.append({
-            "id":         make_id(company, issue_type, open_date),
-            "company":    company,
-            "type":       issue_type,
-            "open_date":  open_date,
-            "close_date": close_date,
-            "units":      units,
-            "source":     "existing"
-        })
+        open_date = (row.get("opening_date") or "").strip()
 
-    return issues
-
-
-def parse_upcoming_issues(soup: BeautifulSoup) -> list:
-    """Parse /upcoming-issue page."""
-    issues = []
-
-    table = soup.find("table")
-    if not table:
-        return issues
-
-    rows = table.find_all("tr")[1:]
-
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) < 4:
-            continue
-
-        company    = cols[0].get_text(strip=True)
-        issue_type = cols[1].get_text(strip=True).upper()
-        open_date  = cols[2].get_text(strip=True)
-        close_date = cols[3].get_text(strip=True)
-
-        # Normalize type label
-        if "FPO" in issue_type:
-            issue_type = "FPO"
-        elif "RIGHT" in issue_type:
-            issue_type = "RIGHT"
-        else:
-            issue_type = "IPO"
-
-        if not company:
-            continue
-
-        issues.append({
-            "id":         make_id(company, issue_type, open_date),
-            "company":    company,
-            "type":       issue_type,
-            "open_date":  open_date,
-            "close_date": close_date,
-            "units":      "N/A",
-            "source":     "upcoming"
-        })
-
-    return issues
+        return {
+            "id":            make_id(company, label, open_date),
+            "company":       company,
+            "symbol":        symbol,
+            "type":          label,
+            "open_date":     open_date,
+            "close_date":    (row.get("closing_date")  or "").strip(),
+            "final_date":    (row.get("final_date")    or "").strip(),
+            "listing_date":  (row.get("listing_date")  or "").strip(),
+            "units":         fmt_units(row.get("total_units")),
+            "issue_price":   str(row.get("issue_price") or "").strip(),
+            "issue_manager": (row.get("issue_manager")  or "").strip(),
+            "status":        status_label(row.get("status")),
+            "source":        "existing",
+        }
+    except Exception as e:
+        print(f"[scraper] Parse error: {e}")
+        return None
 
 
 def scrape_all() -> dict:
-    """Main scrape function. Returns all issues as a dict."""
     all_issues = []
-    seen_ids = set()
+    seen_ids   = set()
 
-    try:
-        # --- Existing Issues ---
-        res = requests.get(EXISTING_URL, headers=HEADERS, timeout=15)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
+    for i, t in enumerate(ISSUE_TYPES):
+        if i > 0:
+            # Brief pause between different issue types
+            time.sleep(PAGE_DELAY)
 
-        for tab_id, issue_type in [
-            ("ipo",        "IPO"),
-            ("fpo",        "FPO"),
-            ("rightshare", "RIGHT"),
-        ]:
-            for issue in parse_existing_issues(soup, tab_id, issue_type):
-                if issue["id"] not in seen_ids:
-                    seen_ids.add(issue["id"])
-                    all_issues.append(issue)
+        records = fetch_all_pages(t["type_id"], t["label"])
 
-    except Exception as e:
-        print(f"[scraper] Error fetching existing issues: {e}")
-
-    try:
-        # --- Upcoming Issues ---
-        res = requests.get(UPCOMING_URL, headers=HEADERS, timeout=15)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        for issue in parse_upcoming_issues(soup):
-            if issue["id"] not in seen_ids:
+        for row in records:
+            issue = parse_record(row, t["label"])
+            if issue and issue["id"] not in seen_ids:
                 seen_ids.add(issue["id"])
                 all_issues.append(issue)
-
-    except Exception as e:
-        print(f"[scraper] Error fetching upcoming issues: {e}")
 
     return {
         "issues":     all_issues,
         "count":      len(all_issues),
-        "scraped_at": datetime.utcnow().isoformat() + "Z"
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+if __name__ == "__main__":
+    result = scrape_all()
+
+    print()
+    print(f"✅ Total issues found: {result['count']}")
+    print()
+
+    # Show first 10
+    for issue in result["issues"][:10]:
+        print(f"  [{issue['type']}] ({issue['status'].upper()}) "
+              f"{issue['company']} ({issue['symbol']})")
+        print(f"        Open:  {issue['open_date']  or 'TBA'}")
+        print(f"        Close: {issue['close_date'] or 'TBA'}")
+        print(f"        Units: {issue['units']}")
+        print()
