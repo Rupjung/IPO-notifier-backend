@@ -6,24 +6,15 @@ from datetime import datetime, timezone
 
 EXISTING_URL = "https://www.sharesansar.com/existing-issues"
 
-# ShareSansar blocks length >= 100. Safe max = 50.
-# Use 20 per page on Render free tier to stay within memory limits.
 PAGE_SIZE  = 20
-PAGE_DELAY = 1  # seconds between pages — keeps memory pressure low
+PAGE_DELAY = 1
 
-# Only fetch what we need for notifications:
-# IPO=1, FPO=2, Rights=3, IPO-Local=5
 ISSUE_TYPES = [
     {"type_id": 1, "label": "IPO"},
     {"type_id": 2, "label": "FPO"},
     {"type_id": 3, "label": "RIGHT"},
     {"type_id": 5, "label": "IPO"},
 ]
-
-# Cap total records per type to avoid memory overload on free tier
-# 265 IPO + 23 FPO + 317 Rights = ~600 total records
-# At ~1KB per record that's fine but pagination overhead adds up
-MAX_RECORDS_PER_TYPE = 300
 
 HEADERS = {
     "User-Agent": (
@@ -55,9 +46,9 @@ def fmt_units(val) -> str:
         return str(val) if val else "N/A"
 
 
-def status_label(status) -> str:
+def get_status(status_val) -> str:
     try:
-        s = int(status)
+        s = int(status_val)
         if s in (-2, -1): return "coming_soon"
         elif s == 0:       return "open"
         else:              return "closed"
@@ -74,6 +65,7 @@ def parse_record(row: dict, label: str) -> dict | None:
             return None
 
         open_date = (row.get("opening_date") or "").strip()
+        status    = get_status(row.get("status"))
 
         return {
             "id":            make_id(company, label, open_date),
@@ -87,7 +79,7 @@ def parse_record(row: dict, label: str) -> dict | None:
             "units":         fmt_units(row.get("total_units")),
             "issue_price":   str(row.get("issue_price") or "").strip(),
             "issue_manager": (row.get("issue_manager")  or "").strip(),
-            "status":        status_label(row.get("status")),
+            "status":        status,
             "source":        "existing",
         }
     except Exception as e:
@@ -95,12 +87,23 @@ def parse_record(row: dict, label: str) -> dict | None:
         return None
 
 
-def fetch_all_pages(type_id: int, label: str) -> list:
-    """Paginate through all records using PAGE_SIZE=20."""
-    all_issues = []
-    start      = 0
-    total      = None
-    draw       = 1
+def fetch_relevant_pages(type_id: int, label: str) -> list:
+    """
+    Fetch pages until we stop seeing open/coming_soon records.
+    
+    ShareSansar returns records ordered by status:
+    - coming_soon first (status=-2)
+    - open next (status=0)  
+    - closed last (status=1+)
+    
+    So we stop fetching as soon as a full page contains only closed records.
+    This way we never load the hundreds of closed records that crash Render.
+    """
+    all_issues     = []
+    start          = 0
+    total          = None
+    draw           = 1
+    consecutive_closed_pages = 0
 
     while True:
         try:
@@ -124,30 +127,41 @@ def fetch_all_pages(type_id: int, label: str) -> list:
 
         if total is None:
             total = data.get("recordsTotal", 0)
-            print(f"[scraper] type={type_id} ({label}): {total} total records")
+            print(f"[scraper] type={type_id} ({label}): {total} total records on ShareSansar")
 
         records = data.get("data", [])
         if not records:
             break
 
+        # Check if this page has any relevant (non-closed) issues
+        page_has_relevant = False
         for row in records:
+            status = get_status(row.get("status"))
+            if status in ("open", "coming_soon"):
+                page_has_relevant = True
             issue = parse_record(row, label)
             if issue:
                 all_issues.append(issue)
 
         start += len(records)
         draw  += 1
+        print(f"[scraper]   fetched {start} records (kept {len(all_issues)} relevant)")
 
-        print(f"[scraper]   fetched {start}/{total}")
+        # If this page had no open/coming_soon, increment counter
+        if not page_has_relevant:
+            consecutive_closed_pages += 1
+        else:
+            consecutive_closed_pages = 0
 
-        # Stop conditions
+        # Stop after 2 consecutive pages of only closed records
+        # No point fetching more closed records
+        if consecutive_closed_pages >= 2:
+            print(f"[scraper]   stopping early — only closed records remain")
+            break
+
         if start >= total:
             break
-        if start >= MAX_RECORDS_PER_TYPE:
-            print(f"[scraper]   hit MAX_RECORDS_PER_TYPE cap ({MAX_RECORDS_PER_TYPE})")
-            break
 
-        # Polite delay between pages
         time.sleep(PAGE_DELAY)
 
     return all_issues
@@ -161,12 +175,19 @@ def scrape_all() -> dict:
         if i > 0:
             time.sleep(PAGE_DELAY)
 
-        for issue in fetch_all_pages(t["type_id"], t["label"]):
+        for issue in fetch_relevant_pages(t["type_id"], t["label"]):
             if issue["id"] not in seen_ids:
                 seen_ids.add(issue["id"])
                 all_issues.append(issue)
 
+    # Sort: open first, then coming_soon, then closed
+    status_order = {"open": 0, "coming_soon": 1, "closed": 2, "unknown": 3}
+    all_issues.sort(key=lambda x: status_order.get(x["status"], 3))
+
     print(f"[scraper] Done. Total unique issues: {len(all_issues)}")
+    open_count  = sum(1 for i in all_issues if i["status"] == "open")
+    soon_count  = sum(1 for i in all_issues if i["status"] == "coming_soon")
+    print(f"[scraper]   Open: {open_count}  Coming Soon: {soon_count}")
 
     return {
         "issues":     all_issues,
@@ -176,12 +197,12 @@ def scrape_all() -> dict:
 
 
 if __name__ == "__main__":
-    import json
     result = scrape_all()
     print()
     print(f"Total: {result['count']}")
-    for issue in result["issues"][:5]:
+    for issue in result["issues"][:10]:
         print(f"  [{issue['type']}] ({issue['status'].upper()}) "
               f"{issue['company']} ({issue['symbol']})")
         print(f"        Open: {issue['open_date'] or 'TBA'}  "
               f"Close: {issue['close_date'] or 'TBA'}")
+        print()
