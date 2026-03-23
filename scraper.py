@@ -6,19 +6,24 @@ from datetime import datetime, timezone
 
 EXISTING_URL = "https://www.sharesansar.com/existing-issues"
 
-# ShareSansar silently returns 0 records if length >= 100
-# Safe maximum is 50 per request — we paginate to get all records
-PAGE_SIZE = 50
+# ShareSansar blocks length >= 100. Safe max = 50.
+# Use 20 per page on Render free tier to stay within memory limits.
+PAGE_SIZE  = 20
+PAGE_DELAY = 1  # seconds between pages — keeps memory pressure low
 
-# Delay between page requests to avoid triggering rate limiting
-PAGE_DELAY = 2  # seconds
-
+# Only fetch what we need for notifications:
+# IPO=1, FPO=2, Rights=3, IPO-Local=5
 ISSUE_TYPES = [
     {"type_id": 1, "label": "IPO"},
     {"type_id": 2, "label": "FPO"},
     {"type_id": 3, "label": "RIGHT"},
-    {"type_id": 5, "label": "IPO"},   # IPO-Local
+    {"type_id": 5, "label": "IPO"},
 ]
+
+# Cap total records per type to avoid memory overload on free tier
+# 265 IPO + 23 FPO + 317 Rights = ~600 total records
+# At ~1KB per record that's fine but pagination overhead adds up
+MAX_RECORDS_PER_TYPE = 300
 
 HEADERS = {
     "User-Agent": (
@@ -60,56 +65,6 @@ def status_label(status) -> str:
         return "unknown"
 
 
-def fetch_all_pages(type_id: int, label: str) -> list:
-    """
-    Fetch all records for a given issue type using pagination.
-    ShareSansar blocks length >= 100, so we use PAGE_SIZE=50
-    and keep fetching until we have all records.
-    """
-    all_records = []
-    start       = 0
-    total       = None   # unknown until first response
-    draw        = 1
-
-    while True:
-        res = requests.get(
-            EXISTING_URL,
-            params={
-                "type":   type_id,
-                "draw":   draw,
-                "start":  start,
-                "length": PAGE_SIZE,
-            },
-            headers=HEADERS,
-            timeout=15,
-        )
-        res.raise_for_status()
-        data = res.json()
-
-        if total is None:
-            total = data.get("recordsTotal", 0)
-            print(f"[scraper] type={type_id} ({label}): {total} total records")
-
-        records = data.get("data", [])
-        if not records:
-            break
-
-        all_records.extend(records)
-        start += len(records)
-        draw  += 1
-
-        print(f"[scraper]   fetched {len(all_records)}/{total}")
-
-        # Stop when we have all records
-        if len(all_records) >= total:
-            break
-
-        # Polite delay between pages
-        time.sleep(PAGE_DELAY)
-
-    return all_records
-
-
 def parse_record(row: dict, label: str) -> dict | None:
     try:
         co      = row.get("company", {})
@@ -140,22 +95,78 @@ def parse_record(row: dict, label: str) -> dict | None:
         return None
 
 
+def fetch_all_pages(type_id: int, label: str) -> list:
+    """Paginate through all records using PAGE_SIZE=20."""
+    all_issues = []
+    start      = 0
+    total      = None
+    draw       = 1
+
+    while True:
+        try:
+            res = requests.get(
+                EXISTING_URL,
+                params={
+                    "type":   type_id,
+                    "draw":   draw,
+                    "start":  start,
+                    "length": PAGE_SIZE,
+                },
+                headers=HEADERS,
+                timeout=15,
+            )
+            res.raise_for_status()
+            data = res.json()
+
+        except Exception as e:
+            print(f"[scraper] Request error type={type_id} start={start}: {e}")
+            break
+
+        if total is None:
+            total = data.get("recordsTotal", 0)
+            print(f"[scraper] type={type_id} ({label}): {total} total records")
+
+        records = data.get("data", [])
+        if not records:
+            break
+
+        for row in records:
+            issue = parse_record(row, label)
+            if issue:
+                all_issues.append(issue)
+
+        start += len(records)
+        draw  += 1
+
+        print(f"[scraper]   fetched {start}/{total}")
+
+        # Stop conditions
+        if start >= total:
+            break
+        if start >= MAX_RECORDS_PER_TYPE:
+            print(f"[scraper]   hit MAX_RECORDS_PER_TYPE cap ({MAX_RECORDS_PER_TYPE})")
+            break
+
+        # Polite delay between pages
+        time.sleep(PAGE_DELAY)
+
+    return all_issues
+
+
 def scrape_all() -> dict:
     all_issues = []
     seen_ids   = set()
 
     for i, t in enumerate(ISSUE_TYPES):
         if i > 0:
-            # Brief pause between different issue types
             time.sleep(PAGE_DELAY)
 
-        records = fetch_all_pages(t["type_id"], t["label"])
-
-        for row in records:
-            issue = parse_record(row, t["label"])
-            if issue and issue["id"] not in seen_ids:
+        for issue in fetch_all_pages(t["type_id"], t["label"]):
+            if issue["id"] not in seen_ids:
                 seen_ids.add(issue["id"])
                 all_issues.append(issue)
+
+    print(f"[scraper] Done. Total unique issues: {len(all_issues)}")
 
     return {
         "issues":     all_issues,
@@ -165,17 +176,12 @@ def scrape_all() -> dict:
 
 
 if __name__ == "__main__":
+    import json
     result = scrape_all()
-
     print()
-    print(f"✅ Total issues found: {result['count']}")
-    print()
-
-    # Show first 10
-    for issue in result["issues"][:10]:
+    print(f"Total: {result['count']}")
+    for issue in result["issues"][:5]:
         print(f"  [{issue['type']}] ({issue['status'].upper()}) "
               f"{issue['company']} ({issue['symbol']})")
-        print(f"        Open:  {issue['open_date']  or 'TBA'}")
-        print(f"        Close: {issue['close_date'] or 'TBA'}")
-        print(f"        Units: {issue['units']}")
-        print()
+        print(f"        Open: {issue['open_date'] or 'TBA'}  "
+              f"Close: {issue['close_date'] or 'TBA'}")

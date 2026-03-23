@@ -3,14 +3,14 @@ services:
     name: sebon-ipo-api
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    # Timeout increased to 120s — scraper paginates ~600 records with delays
+    startCommand: gunicorn app:app --timeout 120 --workers 1
     plan: free
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
 
-  # Cron job to ping the server every 10 mins
-  # This prevents Render free tier from spinning down
+  # Cron job to keep Render free tier warm (pings every 10 mins)
   - type: cron
     name: sebon-keep-warm
     runtime: python
