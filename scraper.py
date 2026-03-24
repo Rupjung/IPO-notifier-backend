@@ -200,9 +200,9 @@ def scrape_all() -> dict:
             if issue_id not in seen_ids:
                 seen_ids[issue_id] = issue
             else:
-                # Duplicate found. Keep the one with "open" status over "coming_soon"
+                # Duplicate found. Keep the one with "coming_soon" status over "open"
                 existing = seen_ids[issue_id]
-                if issue["status"] == "open" and existing["status"] != "open":
+                if issue["status"] == "coming_soon" and existing["status"] != "coming_soon":
                     seen_ids[issue_id] = issue
 
     all_issues = list(seen_ids.values())
