@@ -188,23 +188,11 @@ def fetch_relevant_pages(type_id: int, label: str) -> list:
 
 def scrape_all() -> dict:
     all_issues = []
-    seen_ids   = {}  # Changed to dict: id -> issue
 
     for i, t in enumerate(ISSUE_TYPES):
         if i > 0:
             time.sleep(PAGE_DELAY)
-
-        for issue in fetch_relevant_pages(t["type_id"], t["label"]):
-            issue_id = issue["id"]
-            if issue_id not in seen_ids:
-                seen_ids[issue_id] = issue
-            else:
-                # Duplicate found. Keep the one with "coming_soon" status over "open"
-                existing = seen_ids[issue_id]
-                if issue["status"] == "coming_soon" and existing["status"] != "coming_soon":
-                    seen_ids[issue_id] = issue
-
-    all_issues = list(seen_ids.values())
+        all_issues.extend(fetch_relevant_pages(t["type_id"], t["label"]))
 
     # Sort: open first, then coming_soon, then closed
     status_order = {"open": 0, "coming_soon": 1, "closed": 2, "unknown": 3}
