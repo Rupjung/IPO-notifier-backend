@@ -46,12 +46,27 @@ def fmt_units(val) -> str:
         return str(val) if val else "N/A"
 
 
-def get_status(status_val) -> str:
+def get_status(status_val, opening_date: str = "", closing_date: str = "") -> str:
+    """
+    Determine true status.
+    ShareSansar sometimes marks status=0 (open) but has no actual dates —
+    those are still "Coming Soon" in reality.
+    A record is only truly OPEN if:
+      - status code is 0 AND
+      - it has a real opening_date AND closing_date (not empty)
+    """
     try:
         s = int(status_val)
-        if s in (-2, -1): return "coming_soon"
-        elif s == 0:       return "open"
-        else:              return "closed"
+        if s in (-2, -1):
+            return "coming_soon"
+        elif s == 0:
+            # Only mark as open if actual dates exist
+            if opening_date.strip() and closing_date.strip():
+                return "open"
+            else:
+                return "coming_soon"
+        else:
+            return "closed"
     except Exception:
         return "unknown"
 
@@ -64,8 +79,9 @@ def parse_record(row: dict, label: str) -> dict | None:
         if not company:
             return None
 
-        open_date = (row.get("opening_date") or "").strip()
-        status    = get_status(row.get("status"))
+        open_date  = (row.get("opening_date") or "").strip()
+        close_date = (row.get("closing_date") or "").strip()
+        status     = get_status(row.get("status"), open_date, close_date)
 
         return {
             "id":            make_id(company, label, open_date),
@@ -73,7 +89,7 @@ def parse_record(row: dict, label: str) -> dict | None:
             "symbol":        symbol,
             "type":          label,
             "open_date":     open_date,
-            "close_date":    (row.get("closing_date")  or "").strip(),
+            "close_date":    close_date,
             "final_date":    (row.get("final_date")    or "").strip(),
             "listing_date":  (row.get("listing_date")  or "").strip(),
             "units":         fmt_units(row.get("total_units")),
@@ -136,7 +152,11 @@ def fetch_relevant_pages(type_id: int, label: str) -> list:
         # Check if this page has any relevant (non-closed) issues
         page_has_relevant = False
         for row in records:
-            status = get_status(row.get("status"))
+            status = get_status(
+                    row.get("status"),
+                    (row.get("opening_date") or ""),
+                    (row.get("closing_date") or ""),
+                )
             if status in ("open", "coming_soon"):
                 page_has_relevant = True
             issue = parse_record(row, label)
