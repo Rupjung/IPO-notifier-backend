@@ -34,8 +34,8 @@ def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", str(text)).strip()
 
 
-def make_id(company: str, issue_type: str, open_date: str) -> str:
-    raw = f"{company}-{issue_type}-{open_date}".lower().strip()
+def make_id(company: str, issue_type: str, symbol: str = "") -> str:
+    raw = f"{company}-{issue_type}-{symbol}".lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -84,7 +84,7 @@ def parse_record(row: dict, label: str) -> dict | None:
         status     = get_status(row.get("status"), open_date, close_date)
 
         return {
-            "id":            make_id(company, label, open_date),
+            "id":            make_id(company, label, symbol),
             "company":       company,
             "symbol":        symbol,
             "type":          label,
@@ -189,16 +189,23 @@ def fetch_relevant_pages(type_id: int, label: str) -> list:
 
 def scrape_all() -> dict:
     all_issues = []
-    seen_ids   = set()
+    seen_ids   = {}  # Changed to dict: id -> issue
 
     for i, t in enumerate(ISSUE_TYPES):
         if i > 0:
             time.sleep(PAGE_DELAY)
 
         for issue in fetch_relevant_pages(t["type_id"], t["label"]):
-            if issue["id"] not in seen_ids:
-                seen_ids.add(issue["id"])
-                all_issues.append(issue)
+            issue_id = issue["id"]
+            if issue_id not in seen_ids:
+                seen_ids[issue_id] = issue
+            else:
+                # Duplicate found. Keep the one with "open" status over "coming_soon"
+                existing = seen_ids[issue_id]
+                if issue["status"] == "open" and existing["status"] != "open":
+                    seen_ids[issue_id] = issue
+
+    all_issues = list(seen_ids.values())
 
     # Sort: open first, then coming_soon, then closed
     status_order = {"open": 0, "coming_soon": 1, "closed": 2, "unknown": 3}
