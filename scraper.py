@@ -12,8 +12,7 @@ PAGE_DELAY = 1
 ISSUE_TYPES = [
     {"type_id": 1, "label": "IPO"},
     {"type_id": 2, "label": "FPO"},
-    {"type_id": 3, "label": "RIGHT"},
-    {"type_id": 5, "label": "IPO"},
+    {"type_id": 3, "label": "RIGHT"}
 ]
 
 HEADERS = {
